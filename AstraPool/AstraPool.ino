@@ -1,6 +1,6 @@
 /*
  * AstralPool RS485 WiFi REST API - ESP32-C3 SuperMini
- * Version 1.3.6
+ * Version 1.3.9
  * RS485 auto-direction module: GPIO4 (ESP TX) -> RXD, GPIO3 (ESP RX) <- TXD.
  * GND -> GND; VCC voltage must be verified against module specifications.
  * RS485 A+ -> device A; B- -> device B.
@@ -12,11 +12,13 @@
 #include <ModbusMaster.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
+#include "CachedRegister.h"
 
 struct Measurement { bool ok; float value; uint8_t result; };
 struct FlowReading { bool ok; bool present; uint16_t raw; uint8_t result; };
 
-constexpr const char* FIRMWARE_VERSION = "1.3.6";
+constexpr const char* FIRMWARE_VERSION = "1.3.10";
 const char* WIFI_SSID = "FUN5";
 const char* WIFI_PASSWORD = "atout.be";
 constexpr int RS485_RX = 3;
@@ -83,17 +85,81 @@ String resultName(uint8_t r) {
     default: return "Modbus error";
   }
 }
-String readRegisters(uint8_t fn, uint16_t addr, uint8_t count) {
+// A single-threaded WebServer and ModbusMaster serialize all RS485 access.
+// Cached values are never presented as fresh after the TTL expires.
+// CachedRegister is defined in CachedRegister.h (before Arduino-generated prototypes).
+CachedRegister cache[] = {
+  {1202,2,{0,0},false,0,0xE2}, {1204,2,{0,0},false,0,0xE2},
+  {1302,2,{0,0},false,0,0xE2}, {1304,2,{0,0},false,0,0xE2},
+  {1006,1,{0,0},false,0,0xE2}, {1007,1,{0,0},false,0,0xE2}, {1100,1,{0,0},false,0,0xE2}
+};
+constexpr uint32_t CACHE_TTL_MS = 10000;
+uint32_t modbusRetries = 0;
+uint32_t lastSuccessAt = 0;
+uint32_t lastPollAt = 0;
+uint8_t nextPoll = 0;
+CachedRegister* cached(uint16_t address) {
+  for (auto& item : cache) if (item.addr == address) return &item;
+  return nullptr;
+}
+// ISO 8601 date/time of the LAST SUCCESSFUL Modbus read, not HTTP request time.
+// Uses NTP clock and elapsed milliseconds; returns null until NTP is synchronized.
+String lastReadTimestamp(const CachedRegister* item) {
+  if (!item || !item->valid) return "null";
+  time_t now = time(nullptr);
+  if (now < 1700000000) return "null";  // Clock not synchronized
+  uint32_t elapsed = (uint32_t)(millis() - item->updated);
+  time_t observed = now - (time_t)(elapsed / 1000);
+  struct tm localTime;
+  localtime_r(&observed, &localTime);
+  char stamp[40];
+  if (strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S%z", &localTime) == 0) return "null";
+  String iso(stamp);
+  // Convert +0200 to ISO 8601 +02:00
+  if (iso.length() >= 5) iso = iso.substring(0, iso.length()-2) + ":" + iso.substring(iso.length()-2);
+  return quoted(iso);
+}
+String lastReadAt(uint16_t address) { return lastReadTimestamp(cached(address)); }
+String ageMs(uint16_t address) {
+  CachedRegister* item = cached(address);
+  return item && item->valid ? String((uint32_t)(millis() - item->updated)) : String("null");
+}
+bool fresh(const CachedRegister* item) {
+  return item && item->valid && (uint32_t)(millis()-item->updated) <= CACHE_TTL_MS;
+}
+uint8_t transact(uint8_t fn, uint16_t addr, uint8_t count) {
   requests++;
   lastOperation = "function=" + String(fn) + " address=" + String(addr) + " count=" + String(count);
   uint32_t start = millis();
-  uint8_t result = (fn == 3) ? modbus.readHoldingRegisters(addr, count)
-                             : modbus.readInputRegisters(addr, count);
-  lastDuration = millis() - start;
+  uint8_t result = (fn == 3) ? modbus.readHoldingRegisters(addr,count) : modbus.readInputRegisters(addr,count);
+  lastDuration = millis()-start;
   lastResult = result;
-  if (result == 0) successes++;
+  if (result == 0) { successes++; lastSuccessAt = millis(); }
   else if (result == 0xE2) timeouts++;
   else errors++;
+  return result;
+}
+uint8_t transactRetry(uint8_t fn, uint16_t addr, uint8_t count) {
+  uint8_t code = transact(fn,addr,count);
+  if (code == 0xE2) { delay(80); modbusRetries++; code = transact(fn,addr,count); }
+  return code;
+}
+void pollOne() {
+  CachedRegister& item = cache[nextPoll];
+  nextPoll = (nextPoll + 1) % (sizeof(cache)/sizeof(cache[0]));
+  uint8_t code = transactRetry(3,item.addr,item.count);
+  item.code = code;
+  if (code == 0) {
+    for (uint8_t i=0;i<item.count;i++) item.words[i] = modbus.getResponseBuffer(i);
+    item.updated=millis(); item.valid=true;
+  }
+}
+String readRegisters(uint8_t fn, uint16_t addr, uint8_t count) {
+  lastOperation = "function=" + String(fn) + " address=" + String(addr) + " count=" + String(count);
+  uint32_t start = millis();
+  uint8_t result = transactRetry(fn, addr, count);
+  lastDuration = millis() - start;
+  lastResult = result;
   String out = "{\"ok\":" + String(result == 0 ? "true" : "false") +
                ",\"slave\":" + String(slaveId) + ",\"function\":" + String(fn) +
                ",\"address\":" + String(addr) + ",\"count\":" + String(count) +
@@ -122,15 +188,14 @@ void handleRead() {
   sendJson(lastResult == 0 ? 200 : 502, response);
 }
 // HYDRO TOUCH CHY0444-AST: FC03, two 16-bit registers per float,
-// low word first (CDAB). holding register 1007 tracks the pump contact (SPDT4).
+// low word first (CDAB). holding register 1007 tracks the hydraulic flow switch (SPDT4).
 Measurement readFloatAt(uint16_t address) {
-  Measurement m = {false, NAN, 0};
-  readRegisters(3, address, 2);
-  m.result = lastResult;
-  if (m.result != 0) return m;
-  uint16_t low = modbus.getResponseBuffer(0);
-  uint16_t high = modbus.getResponseBuffer(1);
-  uint32_t bits = (uint32_t(high) << 16) | low;
+  Measurement m = {false, NAN, 0xE2};
+  CachedRegister* c = cached(address);
+  if (!c) return m;
+  m.result = c->code;
+  if (!fresh(c)) return m;
+  uint32_t bits = (uint32_t(c->words[1]) << 16) | c->words[0];
   memcpy(&m.value, &bits, sizeof(m.value));
   m.ok = isfinite(m.value);
   return m;
@@ -138,28 +203,37 @@ Measurement readFloatAt(uint16_t address) {
 String jsonMeasurement(const Measurement& m, uint8_t decimals) {
   return m.ok ? String(m.value, static_cast<unsigned int>(decimals)) : String("null");
 }
-// Pump contact SPDT4: observed 1 with pump ON, 0 with pump OFF.
-// NOT a direct measurement of hydraulic flow (SPDT1).
-FlowReading readPump() {
-  FlowReading f = {false, false, 0, 0};
-  readRegisters(3, 1007, 1);
-  f.result = lastResult;
-  if (f.result != 0) return f;
-  f.raw = modbus.getResponseBuffer(0);
-  if (f.raw == 0 || f.raw == 1) {
-    f.ok = true;
-    f.present = (f.raw == 1);
-  }
+// Hydraulic flow switch now wired to SPDT4; 1 = flow detected, 0 = no flow.
+FlowReading readFlow() {
+  FlowReading f = {false, false, 0, 0xE2};
+  CachedRegister* c = cached(1007);
+  if (!c) return f;
+  f.result = c->code;
+  if (!fresh(c)) return f;
+  f.raw = c->words[0];
+  if (f.raw <= 1) { f.ok=true; f.present=(f.raw==1); }
   return f;
 }
-String jsonPump(const FlowReading& f) {
+String jsonFlow(const FlowReading& f) {
   return f.ok ? String(f.present ? "true" : "false") : String("null");
+}
+// SPDT1 pump auxiliary contact: candidate register 1006.
+FlowReading readPump() {
+  FlowReading p = {false, false, 0, 0xE2};
+  CachedRegister* c = cached(1006);
+  if (!c) return p;
+  p.result = c->code;
+  if (!fresh(c)) return p;
+  p.raw = c->words[0];
+  if (p.raw <= 1) { p.ok = true; p.present = (p.raw == 1); }
+  return p;
 }
 void handleMeasurements() {
   Measurement ph = readFloatAt(1202);
   Measurement phSetpoint = readFloatAt(1204);
   Measurement redox = readFloatAt(1302);
   Measurement redoxSetpoint = readFloatAt(1304);
+  FlowReading flow = readFlow();
   FlowReading pump = readPump();
   bool ok = ph.ok && phSetpoint.ok && redox.ok && redoxSetpoint.ok;
   String out = "{\"version\":" + quoted(FIRMWARE_VERSION) +
@@ -170,12 +244,24 @@ void handleMeasurements() {
                ",\"redox\":" + jsonMeasurement(redox, 2) +
                ",\"redox_mv\":" + jsonMeasurement(redox, 2) +
                ",\"redox_setpoint\":" + jsonMeasurement(redoxSetpoint, 2) +
-               ",\"flow\":null,\"flow_verified\":false" +
-               ",\"pump\":" + jsonPump(pump) +
-               ",\"pump_register\":1007" +
-               ",\"pump_raw\":" + (pump.result == 0 ? String(pump.raw) : String("null")) +
+               ",\"ph_last_read_at\":" + lastReadAt(1202) +
+               ",\"redox_last_read_at\":" + lastReadAt(1302) +
+               ",\"pump_last_read_at\":" + lastReadAt(1006) +
+               ",\"flow_last_read_at\":" + lastReadAt(1007) +
+               ",\"flow\":" + jsonFlow(flow) +
+               ",\"flow_verified\":" + String(flow.ok ? "true" : "false") +
+               ",\"flow_register\":1007" +
+               ",\"flow_raw\":" + (flow.ok ? String(flow.raw) : String("null")) +
+               ",\"flow_modbus_code\":" + String(flow.result) +
+               ",\"pump\":" + jsonFlow(pump) +
+               ",\"pump_register\":1006" +
+               ",\"pump_raw\":" + (pump.ok ? String(pump.raw) : String("null")) +
                ",\"pump_modbus_code\":" + String(pump.result) +
                ",\"unit_redox\":\"mV\"" +
+               ",\"cached\":true,\"cache_ttl_ms\":" + String(CACHE_TTL_MS) +
+               ",\"ph_age_ms\":" + (fresh(cached(1202)) ? String(millis()-cached(1202)->updated) : String("null")) +
+               ",\"pump_age_ms\":" + (fresh(cached(1006)) ? String(millis()-cached(1006)->updated) : String("null")) +
+               ",\"flow_age_ms\":" + (fresh(cached(1007)) ? String(millis()-cached(1007)->updated) : String("null")) +
                ",\"modbus_codes\":{\"ph\":" + String(ph.result) +
                ",\"ph_setpoint\":" + String(phSetpoint.result) +
                ",\"redox\":" + String(redox.result) +
@@ -190,6 +276,7 @@ void handlePh() {
   String out = "{\"version\":" + quoted(FIRMWARE_VERSION) +
                ",\"ok\":" + String(ok ? "true" : "false") +
                ",\"ph\":" + jsonMeasurement(value, 3) +
+               ",\"ph_last_read_at\":" + lastReadAt(1202) +
                ",\"ph_setpoint\":" + jsonMeasurement(setpoint, 3) +
                ",\"modbus_codes\":{\"ph\":" + String(value.result) +
                ",\"ph_setpoint\":" + String(setpoint.result) + "}}";
@@ -202,6 +289,7 @@ void handleRedox() {
   String out = "{\"version\":" + quoted(FIRMWARE_VERSION) +
                ",\"ok\":" + String(ok ? "true" : "false") +
                ",\"redox\":" + jsonMeasurement(value, 2) +
+               ",\"redox_last_read_at\":" + lastReadAt(1302) +
                ",\"redox_mv\":" + jsonMeasurement(value, 2) +
                ",\"redox_setpoint\":" + jsonMeasurement(setpoint, 2) +
                ",\"unit\":\"mV\"" +
@@ -209,46 +297,63 @@ void handleRedox() {
                ",\"redox_setpoint\":" + String(setpoint.result) + "}}";
   sendJson(ok ? 200 : 502, out);
 }
-// Hydraulic flow is wired to SPDT1; its Modbus register is unknown.
-// Returning null prevents the pump contact from being mistaken for real flow.
+// Flow switch on SPDT4, holding register 1007.
 void handleFlow() {
+  FlowReading flow = readFlow();
   String out = "{\"version\":" + quoted(FIRMWARE_VERSION) +
-               ",\"ok\":false,\"flow\":null,\"flow_verified\":false," +
-               "\"flow_register\":null,\"note\":\"SPDT1 hydraulic flow register not identified\"}";
-  sendJson(200, out);
+               ",\"ok\":" + String(flow.ok ? "true" : "false") +
+               ",\"flow\":" + jsonFlow(flow) +
+               ",\"flow_verified\":" + String(flow.ok ? "true" : "false") +
+               ",\"flow_last_read_at\":" + lastReadAt(1007) +
+               ",\"flow_register\":1007" +
+               ",\"flow_raw\":" + (flow.ok ? String(flow.raw) : String("null")) +
+               ",\"modbus_code\":" + String(flow.result) + "}";
+  sendJson(flow.ok ? 200 : 502, out);
 }
-// Pump dry contact on SPDT4, read from holding register 1007.
+// Pump auxiliary contact on SPDT1: holding register 1006.
 void handlePump() {
   FlowReading pump = readPump();
   String out = "{\"version\":" + quoted(FIRMWARE_VERSION) +
                ",\"ok\":" + String(pump.ok ? "true" : "false") +
-               ",\"pump\":" + jsonPump(pump) +
-               ",\"pump_register\":1007" +
-               ",\"pump_raw\":" + (pump.result == 0 ? String(pump.raw) : String("null")) +
+               ",\"pump\":" + jsonFlow(pump) +
+               ",\"pump_last_read_at\":" + lastReadAt(1006) +
+               ",\"pump_register\":1006" +
+               ",\"pump_raw\":" + (pump.ok ? String(pump.raw) : String("null")) +
                ",\"modbus_code\":" + String(pump.result) + "}";
   sendJson(pump.ok ? 200 : 502, out);
 }
 void handleStatus() {
   // Holding register 1100: injection activation indicator (user identified).
   // Read on demand; never interpret a Modbus failure as injection disabled.
-  readRegisters(3, 1100, 1);
-  const uint8_t injectionCode = lastResult;
-  const bool injectionReadOk = (injectionCode == 0);
-  const uint16_t injectionRaw = injectionReadOk ? modbus.getResponseBuffer(0) : 0;
+  CachedRegister* inj = cached(1100);
+  const uint8_t injectionCode = inj ? inj->code : 0xE2;
+  const bool injectionReadOk = fresh(inj);
+  const uint16_t injectionRaw = injectionReadOk ? inj->words[0] : 0;
   const String injectionJson = injectionReadOk ? String(injectionRaw) : String("null");
   String out = "{\"version\":" + quoted(FIRMWARE_VERSION) +
                ",\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") +
                ",\"ip\":" + quoted(WiFi.localIP().toString()) +
                ",\"rssi_dbm\":" + String(WiFi.RSSI()) +
                ",\"uptime_ms\":" + String(millis()) +
+               ",\"time_synced\":" + String(time(nullptr) >= 1700000000 ? "true" : "false") +
+               ",\"ph_last_read_at\":" + lastReadAt(1202) +
+               ",\"redox_last_read_at\":" + lastReadAt(1302) +
+               ",\"pump_last_read_at\":" + lastReadAt(1006) +
+               ",\"flow_last_read_at\":" + lastReadAt(1007) +
                ",\"slave\":" + String(slaveId) +
                ",\"injection_active\":" + (injectionReadOk && injectionRaw <= 1 ? String(injectionRaw == 1 ? "true" : "false") : String("null")) +
                ",\"injection_register\":1100" +
+               ",\"injection_age_ms\":" + (injectionReadOk ? String(millis()-inj->updated) : String("null")) +
                ",\"injection_raw\":" + injectionJson +
                ",\"injection_modbus_code\":" + String(injectionCode) +
                ",\"baud\":" + String(baudRate) +
                ",\"parity\":" + quoted(parityMode == 0 ? "N" : (parityMode == 1 ? "E" : "O")) +
                ",\"requests\":" + String(requests) +
+               ",\"modbus_retries\":" + String(modbusRetries) +
+               ",\"modbus_ok\":" + String(successes) +
+               ",\"modbus_timeouts\":" + String(timeouts) +
+               ",\"last_success_ms\":" + (lastSuccessAt ? String(lastSuccessAt) : String("null")) +
+               ",\"data_age_ms\":" + (lastSuccessAt ? String(millis()-lastSuccessAt) : String("null")) +
                ",\"ok\":" + String(successes) +
                ",\"timeouts\":" + String(timeouts) +
                ",\"errors\":" + String(errors) +
@@ -360,11 +465,11 @@ void handleScan() {
 
 void handleRoot() {
   server.send(200, "text/plain; charset=utf-8",
-    "AstralPool RS485 API v1.3.5 (read-only)\n"
+    "AstralPool RS485 API v1.3.7 (read-only)\n"
     "GET /api/status\n"
     "GET /api/measurements (pH and redox)\n"
     "GET /api/flow (hydraulic SPDT1: unknown, returns null)\n"
-    "GET /api/pump (SPDT4: register 1007)\n"
+    "GET /api/pump (SPDT1: register 1006)\n"
     "GET /api/scan?start=0&count=100&ph=7.41&redox=751\n"
     "GET /api/read?function=4&address=0x51&count=1\n"
     "POST /api/config?slave=2&baud=9600&parity=N\n"
@@ -383,6 +488,10 @@ void setup() {
   }
   Serial.println();
   Serial.print("IP: "); Serial.println(WiFi.localIP());
+  // Brussels timezone: CET in winter, CEST in summer; NTP resyncs automatically.
+  setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+  tzset();
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/read", HTTP_GET, handleRead);
@@ -398,6 +507,7 @@ void setup() {
 }
 void loop() {
   server.handleClient();
+  if ((uint32_t)(millis()-lastPollAt) >= 350) { lastPollAt=millis(); pollOne(); }
   if (WiFi.status() != WL_CONNECTED) {
     static uint32_t lastRetry = 0;
     if (millis() - lastRetry > 10000) { lastRetry = millis(); WiFi.reconnect(); }
