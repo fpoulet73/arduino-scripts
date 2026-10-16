@@ -1,5 +1,5 @@
 AstralPool v1.3.10
-SPDT1 pump: holding register 1006. SPDT4 flow: holding register 1007. Injection indicator: 1100.
+SPDT1 pump: holding register 1006. SPDT4 flow: holding register 1007. Machine enabled switch (manual): 1100.
 Cache, timestamps, retry behavior preserved.
 
 Unzip into /root, then:

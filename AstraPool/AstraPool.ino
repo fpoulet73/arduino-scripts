@@ -1,6 +1,6 @@
 /*
  * AstralPool RS485 WiFi REST API - ESP32-C3 SuperMini
- * Version 1.3.9
+ * Version 1.3.14
  * RS485 auto-direction module: GPIO4 (ESP TX) -> RXD, GPIO3 (ESP RX) <- TXD.
  * GND -> GND; VCC voltage must be verified against module specifications.
  * RS485 A+ -> device A; B- -> device B.
@@ -8,22 +8,53 @@
  * pH/Redox register mappings confirmed; hydraulic flow register not yet identified.
  */
 #include <WiFi.h>
+#include <ESP32Ping.h>
 #include <WebServer.h>
 #include <ModbusMaster.h>
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "CachedRegister.h"
 
 struct Measurement { bool ok; float value; uint8_t result; };
 struct FlowReading { bool ok; bool present; uint16_t raw; uint8_t result; };
 
-constexpr const char* FIRMWARE_VERSION = "1.3.10";
+constexpr const char* FIRMWARE_VERSION = "1.3.14";
 const char* WIFI_SSID = "FUN5";
 const char* WIFI_PASSWORD = "atout.be";
 constexpr int RS485_RX = 3;
 constexpr int RS485_TX = 4;
 constexpr uint16_t HTTP_PORT = 80;
+// Change this secret before flashing. Only POST /api/restart accepts it.
+const char* RESTART_TOKEN = "CHANGE_ME_LONG_RANDOM_SECRET";
+constexpr uint32_t WIFI_RETRY_MS = 10000;
+constexpr uint32_t WIFI_RESTART_MS = 300000; // status compatibility; target watchdog governs reboot
+constexpr uint32_t TARGET_CHECK_INTERVAL_MS = 15000;
+constexpr uint32_t TARGET_RESTART_MS = 300000; // 5 minutes of continuous failures
+const IPAddress TARGET_IP(192, 168, 10, 100);
+uint32_t targetLastCheckAt = 0;
+uint32_t targetFailureSince = 0;
+bool targetReachable = false;
+bool targetEverChecked = false;
+uint32_t targetPingFailures = 0;
+uint32_t targetPingSuccesses = 0;
+constexpr uint32_t POLL_INTERVAL_MS = 1500;
+uint32_t wifiLostAt = 0, wifiLastRetryAt = 0, wifiReconnectAttempts = 0;
+uint32_t wifiRestarts = 0; // RAM counter; reset after ESP restart
+RTC_DATA_ATTR uint32_t bootCount = 0;
+RTC_DATA_ATTR uint32_t lastRequestedRestart = 0; // 1=target unavailable, 2=HTTP
+SemaphoreHandle_t busMutex = nullptr;
+SemaphoreHandle_t cacheMutex = nullptr;
+TaskHandle_t modbusTaskHandle = nullptr;
+uint32_t modbusConsecutiveFailures = 0;
+constexpr uint32_t WATCHDOG_TIMEOUT_MS = 30000;
+uint32_t restartAt = 0;
+bool restartScheduled = false;
+
 
 HardwareSerial& RS485 = Serial1;
 ModbusMaster modbus;
@@ -98,6 +129,15 @@ uint32_t modbusRetries = 0;
 uint32_t lastSuccessAt = 0;
 uint32_t lastPollAt = 0;
 uint8_t nextPoll = 0;
+// The worker owns cache writes. HTTP only receives locked copies.
+bool snapshotRegister(uint16_t address, CachedRegister& out) {
+  if (!cacheMutex || xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+  bool found = false;
+  for (const auto& item : cache) if (item.addr == address) { out = item; found = true; break; }
+  xSemaphoreGive(cacheMutex);
+  return found;
+}
+String lastReadAt(uint16_t address);
 CachedRegister* cached(uint16_t address) {
   for (auto& item : cache) if (item.addr == address) return &item;
   return nullptr;
@@ -119,10 +159,13 @@ String lastReadTimestamp(const CachedRegister* item) {
   if (iso.length() >= 5) iso = iso.substring(0, iso.length()-2) + ":" + iso.substring(iso.length()-2);
   return quoted(iso);
 }
-String lastReadAt(uint16_t address) { return lastReadTimestamp(cached(address)); }
+String lastReadAt(uint16_t address) {
+  CachedRegister item;
+  return snapshotRegister(address, item) ? lastReadTimestamp(&item) : String("null");
+}
 String ageMs(uint16_t address) {
-  CachedRegister* item = cached(address);
-  return item && item->valid ? String((uint32_t)(millis() - item->updated)) : String("null");
+  CachedRegister item;
+  return snapshotRegister(address, item) && item.valid ? String((uint32_t)(millis()-item.updated)) : String("null");
 }
 bool fresh(const CachedRegister* item) {
   return item && item->valid && (uint32_t)(millis()-item->updated) <= CACHE_TTL_MS;
@@ -145,18 +188,31 @@ uint8_t transactRetry(uint8_t fn, uint16_t addr, uint8_t count) {
   return code;
 }
 void pollOne() {
-  CachedRegister& item = cache[nextPoll];
+  const uint8_t index = nextPoll;
   nextPoll = (nextPoll + 1) % (sizeof(cache)/sizeof(cache[0]));
-  uint8_t code = transactRetry(3,item.addr,item.count);
-  item.code = code;
-  if (code == 0) {
-    for (uint8_t i=0;i<item.count;i++) item.words[i] = modbus.getResponseBuffer(i);
-    item.updated=millis(); item.valid=true;
+  const uint16_t addr = cache[index].addr;
+  const uint8_t count = cache[index].count;
+  if (xSemaphoreTake(busMutex, pdMS_TO_TICKS(10000)) != pdTRUE) return;
+  uint8_t code = transactRetry(3,addr,count);
+  uint16_t words[2] = {0,0};
+  if (code == 0) for (uint8_t i=0;i<count;i++) words[i] = modbus.getResponseBuffer(i);
+  xSemaphoreGive(busMutex);
+  if (xSemaphoreTake(cacheMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    cache[index].code = code;
+    if (code == 0) {
+      for (uint8_t i=0;i<count;i++) cache[index].words[i] = words[i];
+      cache[index].updated=millis(); cache[index].valid=true;
+    }
+    xSemaphoreGive(cacheMutex);
   }
+  if (code == 0) modbusConsecutiveFailures = 0;
+  else modbusConsecutiveFailures++;
 }
 String readRegisters(uint8_t fn, uint16_t addr, uint8_t count) {
   lastOperation = "function=" + String(fn) + " address=" + String(addr) + " count=" + String(count);
   uint32_t start = millis();
+  if (xSemaphoreTake(busMutex, pdMS_TO_TICKS(6000)) != pdTRUE)
+    return "{\"ok\":false,\"result_code\":-1,\"result\":\"Modbus busy\",\"registers\":[]}";
   uint8_t result = transactRetry(fn, addr, count);
   lastDuration = millis() - start;
   lastResult = result;
@@ -172,6 +228,7 @@ String readRegisters(uint8_t fn, uint16_t addr, uint8_t count) {
       out += String(modbus.getResponseBuffer(i));
     }
   }
+  xSemaphoreGive(busMutex);
   return out + "]}";
 }
 void handleRead() {
@@ -185,17 +242,17 @@ void handleRead() {
     sendJson(400, "{\"error\":\"Invalid address/function/count (max count 32)\"}"); return;
   }
   String response = readRegisters((uint8_t)fn, (uint16_t)addr, (uint8_t)count);
-  sendJson(lastResult == 0 ? 200 : 502, response);
+  sendJson(response.indexOf("\"ok\":true") >= 0 ? 200 : 502, response);
 }
 // HYDRO TOUCH CHY0444-AST: FC03, two 16-bit registers per float,
 // low word first (CDAB). holding register 1007 tracks the hydraulic flow switch (SPDT4).
 Measurement readFloatAt(uint16_t address) {
   Measurement m = {false, NAN, 0xE2};
-  CachedRegister* c = cached(address);
-  if (!c) return m;
-  m.result = c->code;
-  if (!fresh(c)) return m;
-  uint32_t bits = (uint32_t(c->words[1]) << 16) | c->words[0];
+  CachedRegister item;
+  if (!snapshotRegister(address, item)) return m;
+  m.result = item.code;
+  if (!fresh(&item)) return m;
+  uint32_t bits = (uint32_t(item.words[1]) << 16) | item.words[0];
   memcpy(&m.value, &bits, sizeof(m.value));
   m.ok = isfinite(m.value);
   return m;
@@ -206,11 +263,11 @@ String jsonMeasurement(const Measurement& m, uint8_t decimals) {
 // Hydraulic flow switch now wired to SPDT4; 1 = flow detected, 0 = no flow.
 FlowReading readFlow() {
   FlowReading f = {false, false, 0, 0xE2};
-  CachedRegister* c = cached(1007);
-  if (!c) return f;
-  f.result = c->code;
-  if (!fresh(c)) return f;
-  f.raw = c->words[0];
+  CachedRegister item;
+  if (!snapshotRegister(1007, item)) return f;
+  f.result = item.code;
+  if (!fresh(&item)) return f;
+  f.raw = item.words[0];
   if (f.raw <= 1) { f.ok=true; f.present=(f.raw==1); }
   return f;
 }
@@ -220,11 +277,11 @@ String jsonFlow(const FlowReading& f) {
 // SPDT1 pump auxiliary contact: candidate register 1006.
 FlowReading readPump() {
   FlowReading p = {false, false, 0, 0xE2};
-  CachedRegister* c = cached(1006);
-  if (!c) return p;
-  p.result = c->code;
-  if (!fresh(c)) return p;
-  p.raw = c->words[0];
+  CachedRegister item;
+  if (!snapshotRegister(1006, item)) return p;
+  p.result = item.code;
+  if (!fresh(&item)) return p;
+  p.raw = item.words[0];
   if (p.raw <= 1) { p.ok = true; p.present = (p.raw == 1); }
   return p;
 }
@@ -259,9 +316,9 @@ void handleMeasurements() {
                ",\"pump_modbus_code\":" + String(pump.result) +
                ",\"unit_redox\":\"mV\"" +
                ",\"cached\":true,\"cache_ttl_ms\":" + String(CACHE_TTL_MS) +
-               ",\"ph_age_ms\":" + (fresh(cached(1202)) ? String(millis()-cached(1202)->updated) : String("null")) +
-               ",\"pump_age_ms\":" + (fresh(cached(1006)) ? String(millis()-cached(1006)->updated) : String("null")) +
-               ",\"flow_age_ms\":" + (fresh(cached(1007)) ? String(millis()-cached(1007)->updated) : String("null")) +
+               ",\"ph_age_ms\":" + ageMs(1202) +
+               ",\"pump_age_ms\":" + ageMs(1006) +
+               ",\"flow_age_ms\":" + ageMs(1007) +
                ",\"modbus_codes\":{\"ph\":" + String(ph.result) +
                ",\"ph_setpoint\":" + String(phSetpoint.result) +
                ",\"redox\":" + String(redox.result) +
@@ -322,30 +379,103 @@ void handlePump() {
                ",\"modbus_code\":" + String(pump.result) + "}";
   sendJson(pump.ok ? 200 : 502, out);
 }
+void handleRestart() {
+  if (strcmp(RESTART_TOKEN, "CHANGE_ME_LONG_RANDOM_SECRET") == 0) {
+    sendJson(503, "{\"ok\":false,\"error\":\"Configure RESTART_TOKEN before enabling restart\"}");
+    return;
+  }
+  if (!server.hasArg("token") || server.arg("token") != RESTART_TOKEN) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Invalid token\"}");
+    return;
+  }
+  sendJson(200, "{\"ok\":true,\"restarting\":true}");
+  restartAt = millis();
+  restartScheduled = true;
+}
+void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wifiLostAt) Serial.println("WiFi reconnected: " + WiFi.localIP().toString());
+    wifiLostAt = 0;
+    return;
+  }
+  uint32_t now = millis();
+  if (!wifiLostAt) {
+    wifiLostAt = now ? now : 1;
+    wifiLastRetryAt = now - WIFI_RETRY_MS;
+    Serial.println("WiFi disconnected");
+  }
+  if ((uint32_t)(now - wifiLastRetryAt) >= WIFI_RETRY_MS) {
+    wifiLastRetryAt = now;
+    wifiReconnectAttempts++;
+    WiFi.reconnect();
+    Serial.println("WiFi reconnect attempt " + String(wifiReconnectAttempts));
+  }
+}
+void maintainTargetReachability() {
+  const uint32_t now = millis();
+  if (targetEverChecked && (uint32_t)(now - targetLastCheckAt) < TARGET_CHECK_INTERVAL_MS) return;
+  targetEverChecked = true;
+  targetLastCheckAt = now;
+
+  // Loss of WiFi counts as target unreachable. Do not block on ICMP without WiFi.
+  const bool reachable = (WiFi.status() == WL_CONNECTED) && Ping.ping(TARGET_IP, 1);
+  targetReachable = reachable;
+  if (reachable) {
+    if (targetFailureSince) Serial.println("Target 192.168.10.100 reachable again");
+    targetFailureSince = 0;
+    targetPingSuccesses++;
+  } else {
+    targetPingFailures++;
+    if (!targetFailureSince) {
+      targetFailureSince = now ? now : 1;
+      Serial.println("Target 192.168.10.100 unreachable: starting 5-minute timer");
+    }
+    if ((uint32_t)(now - targetFailureSince) >= TARGET_RESTART_MS) {
+      Serial.println("Target unreachable for 5 minutes; restarting ESP");
+      Serial.flush();
+      lastRequestedRestart = 1;
+      ESP.restart();
+    }
+  }
+}
 void handleStatus() {
-  // Holding register 1100: injection activation indicator (user identified).
-  // Read on demand; never interpret a Modbus failure as injection disabled.
-  CachedRegister* inj = cached(1100);
-  const uint8_t injectionCode = inj ? inj->code : 0xE2;
-  const bool injectionReadOk = fresh(inj);
-  const uint16_t injectionRaw = injectionReadOk ? inj->words[0] : 0;
-  const String injectionJson = injectionReadOk ? String(injectionRaw) : String("null");
+  // Holding register 1100: manual switch telling whether the machine is enabled.
+  // It does NOT mean a pH/redox injection is running: the machine decides that itself.
+  // Read on demand; never interpret a Modbus failure as machine disabled.
+  CachedRegister machItem;
+  const bool hasMachine = snapshotRegister(1100, machItem);
+  const bool machineReadOk = hasMachine && fresh(&machItem);
   String out = "{\"version\":" + quoted(FIRMWARE_VERSION) +
                ",\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") +
                ",\"ip\":" + quoted(WiFi.localIP().toString()) +
-               ",\"rssi_dbm\":" + String(WiFi.RSSI()) +
+               ",\"rssi_dbm\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0) +
+               ",\"wifi_reconnect_attempts\":" + String(wifiReconnectAttempts) +
+               ",\"wifi_disconnected_ms\":" + (wifiLostAt ? String((uint32_t)(millis()-wifiLostAt)) : String("0")) +
+               ",\"wifi_restart_after_ms\":" + String(WIFI_RESTART_MS) +
+               ",\"target_ip\":\"192.168.10.100\"" +
+               ",\"target_reachable\":" + (targetEverChecked ? String(targetReachable ? "true" : "false") : String("null")) +
+               ",\"target_check_interval_ms\":" + String(TARGET_CHECK_INTERVAL_MS) +
+               ",\"target_unreachable_ms\":" + (targetFailureSince ? String((uint32_t)(millis() - targetFailureSince)) : String("0")) +
+               ",\"target_restart_after_ms\":" + String(TARGET_RESTART_MS) +
+               ",\"target_ping_successes\":" + String(targetPingSuccesses) +
+               ",\"target_ping_failures\":" + String(targetPingFailures) +
                ",\"uptime_ms\":" + String(millis()) +
+               ",\"boot_count\":" + String(bootCount) +
+               ",\"restart_reason\":" + quoted(esp_reset_reason() == ESP_RST_TASK_WDT ? "task_watchdog" :
+                  esp_reset_reason() == ESP_RST_WDT ? "watchdog" :
+                  esp_reset_reason() == ESP_RST_BROWNOUT ? "brownout" :
+                  lastRequestedRestart == 1 ? "target_unreachable" :
+                  lastRequestedRestart == 2 ? "remote_api" : "other_or_power_on") +
+               ",\"free_heap\":" + String(ESP.getFreeHeap()) +
+               ",\"modbus_consecutive_failures\":" + String(modbusConsecutiveFailures) +
                ",\"time_synced\":" + String(time(nullptr) >= 1700000000 ? "true" : "false") +
                ",\"ph_last_read_at\":" + lastReadAt(1202) +
                ",\"redox_last_read_at\":" + lastReadAt(1302) +
                ",\"pump_last_read_at\":" + lastReadAt(1006) +
                ",\"flow_last_read_at\":" + lastReadAt(1007) +
                ",\"slave\":" + String(slaveId) +
-               ",\"injection_active\":" + (injectionReadOk && injectionRaw <= 1 ? String(injectionRaw == 1 ? "true" : "false") : String("null")) +
-               ",\"injection_register\":1100" +
-               ",\"injection_age_ms\":" + (injectionReadOk ? String(millis()-inj->updated) : String("null")) +
-               ",\"injection_raw\":" + injectionJson +
-               ",\"injection_modbus_code\":" + String(injectionCode) +
+               ",\"machine_enabled\":" + (machineReadOk && machItem.words[0] <= 1 ? String(machItem.words[0] == 1 ? "true" : "false") : String("null")) +
+               ",\"machine_register\":1100" +
                ",\"baud\":" + String(baudRate) +
                ",\"parity\":" + quoted(parityMode == 0 ? "N" : (parityMode == 1 ? "E" : "O")) +
                ",\"requests\":" + String(requests) +
@@ -381,8 +511,12 @@ void handleConfig() {
     if (p != "N" && p != "E" && p != "O") { sendJson(400, "{\"error\":\"parity must be N/E/O\"}"); return; }
     newParity = (p == "E") ? 1 : ((p == "O") ? 2 : 0);
   }
+  if (xSemaphoreTake(busMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
+    sendJson(503,"{\"ok\":false,\"error\":\"Modbus busy\"}"); return;
+  }
   slaveId = newSlave; baudRate = newBaud; parityMode = newParity;
   initModbus();
+  xSemaphoreGive(busMutex);
   sendJson(200, "{\"ok\":true,\"slave\":" + String(slaveId) + ",\"baud\":" + String(baudRate) + ",\"parity\":" + quoted(parityMode == 0 ? "N" : (parityMode == 1 ? "E" : "O")) + "}");
 }
 
@@ -421,13 +555,17 @@ void handleScan() {
   bool first=true; uint32_t successful=0, failed=0;
   for (uint32_t base=start; base<start+count; base+=20) {
     uint8_t n=(uint8_t)min(uint32_t(20),start+count-base);
+    if (xSemaphoreTake(busMutex, pdMS_TO_TICKS(6000)) != pdTRUE) { failed++; continue; }
     requests++;lastOperation="scan function=3 address="+String(base)+" count="+String(n);
     uint32_t t=millis();uint8_t r=modbus.readHoldingRegisters((uint16_t)base,n);
     lastDuration=millis()-t;lastResult=r;
+    uint16_t scanWords[20] = {0};
+    if (r == 0) for (uint8_t i=0;i<n;i++) scanWords[i]=modbus.getResponseBuffer(i);
+    xSemaphoreGive(busMutex);
     if (r!=0) {failed++; if(r==0xE2)timeouts++;else errors++;continue;}
     successes++;successful++;
     for (uint8_t i=0;i<n;i++) {
-      uint16_t v=modbus.getResponseBuffer(i), w=swap16(v);
+      uint16_t v=scanWords[i], w=swap16(v);
       for (int k=0;k<2;k++) {
         int32_t raw=k?w:v;
         for (int d=0;d<=3;d++) {
@@ -442,7 +580,7 @@ void handleScan() {
         }
       }
       if (i+1<n) {
-        uint16_t b=modbus.getResponseBuffer(i+1);
+        uint16_t b=scanWords[i+1];
         const char* orders[]={"ABCD","CDAB","BADC","DCBA"};
         for (uint8_t o=0;o<4;o++) {
           float f=decodeFloat(v,b,o);
@@ -465,21 +603,44 @@ void handleScan() {
 
 void handleRoot() {
   server.send(200, "text/plain; charset=utf-8",
-    "AstralPool RS485 API v1.3.7 (read-only)\n"
+    "AstralPool RS485 API v1.3.14 (Modbus read-only)\n"
     "GET /api/status\n"
     "GET /api/measurements (pH and redox)\n"
-    "GET /api/flow (hydraulic SPDT1: unknown, returns null)\n"
+    "GET /api/flow (hydraulic SPDT4: register 1007)\n"
     "GET /api/pump (SPDT1: register 1006)\n"
+    "POST /api/restart?token=YOUR_TOKEN\n"
     "GET /api/scan?start=0&count=100&ph=7.41&redox=751\n"
     "GET /api/read?function=4&address=0x51&count=1\n"
     "POST /api/config?slave=2&baud=9600&parity=N\n"
-    "No authentication: use only on a trusted LAN.\n");
+    "Restart requires token; other endpoints trusted LAN only.\n");
+}
+// Dedicated worker: Modbus timeout never blocks the HTTP event loop.
+void modbusWorker(void*) {
+  esp_task_wdt_add(nullptr);
+  for (;;) {
+    pollOne();
+    esp_task_wdt_reset();
+    vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+  }
 }
 void setup() {
   Serial.begin(115200);
+  bootCount++;
+  busMutex = xSemaphoreCreateMutex();
+  cacheMutex = xSemaphoreCreateMutex();
+  if (!busMutex || !cacheMutex) { Serial.println("Mutex allocation failed"); ESP.restart(); }
   initModbus();
+  esp_task_wdt_config_t wdtConfig = {};
+  wdtConfig.timeout_ms = WATCHDOG_TIMEOUT_MS;
+  wdtConfig.idle_core_mask = 0;
+  wdtConfig.trigger_panic = true;
+  esp_err_t wdtResult = esp_task_wdt_reconfigure(&wdtConfig);
+  if (wdtResult != ESP_OK) wdtResult = esp_task_wdt_init(&wdtConfig);
+  if (wdtResult == ESP_OK) esp_task_wdt_add(nullptr);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.setSleep(false); // improve reliability on some ESP32-C3 access points
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting WiFi");
   uint32_t start = millis();
@@ -494,6 +655,7 @@ void setup() {
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/restart", HTTP_POST, handleRestart);
   server.on("/api/read", HTTP_GET, handleRead);
   server.on("/api/measurements", HTTP_GET, handleMeasurements);
   server.on("/api/ph", HTTP_GET, handlePh);
@@ -504,12 +666,20 @@ void setup() {
   server.on("/api/config", HTTP_POST, handleConfig);
   server.onNotFound([](){ sendJson(404, "{\"error\":\"Not found\"}"); });
   server.begin();
+  if (xTaskCreate(modbusWorker, "modbusWorker", 6144, nullptr, 1, &modbusTaskHandle) != pdPASS)
+    Serial.println("ERROR: Modbus worker not started");
 }
 void loop() {
+  // Always service HTTP and WiFi before starting potentially slow RS485 reads.
   server.handleClient();
-  if ((uint32_t)(millis()-lastPollAt) >= 350) { lastPollAt=millis(); pollOne(); }
-  if (WiFi.status() != WL_CONNECTED) {
-    static uint32_t lastRetry = 0;
-    if (millis() - lastRetry > 10000) { lastRetry = millis(); WiFi.reconnect(); }
+  maintainWiFi();
+  maintainTargetReachability();
+  if (restartScheduled && (uint32_t)(millis() - restartAt) >= 300) {
+    Serial.println("Remote restart requested");
+    Serial.flush();
+    lastRequestedRestart = 2;
+    ESP.restart();
   }
+  esp_task_wdt_reset();
+  delay(1);
 }
